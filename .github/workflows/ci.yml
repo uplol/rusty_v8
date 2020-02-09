@@ -26,30 +26,57 @@ jobs:
           - os: macOS-latest
             target: x86_64-apple-darwin
             variant: debug
+            cargo: cargo
 
           - os: macOS-latest
             target: x86_64-apple-darwin
             variant: release
+            cargo: cargo
 
           - os: ubuntu-16.04
             target: x86_64-unknown-linux-gnu
             variant: debug
+            cargo: cargo
 
           - os: ubuntu-16.04
             target: x86_64-unknown-linux-gnu
             variant: release
+            cargo: cargo
 
           - os: windows-2019
             target: x86_64-pc-windows-msvc
             variant: release # Note: we do not support windows debug builds.
+            cargo: cargo
 
           - os: ubuntu-16.04
             target: aarch64-unknown-linux-gnu
             variant: debug
+            cargo: cargo
 
           - os: ubuntu-16.04
             target: aarch64-unknown-linux-gnu
             variant: release
+            cargo: cargo
+
+          - os: ubuntu-16.04
+            target: aarch64-linux-android
+            variant: debug
+            cargo: cross
+
+          - os: ubuntu-16.04
+            target: aarch64-linux-android
+            variant: release
+            cargo: cross
+
+          - os: ubuntu-16.04
+            target: x86_64-linux-android
+            variant: debug
+            cargo: cross
+
+          - os: ubuntu-16.04
+            target: x86_64-linux-android
+            variant: release
+            cargo: cross
 
     env:
       V8_FROM_SOURCE: true
@@ -97,6 +124,20 @@ jobs:
 
           echo "::set-env name=CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER::/usr/bin/aarch64-linux-gnu-gcc-5"
           echo "::set-env name=QEMU_LD_PREFIX::/usr/aarch64-linux-gnu"
+
+      - name: Install rust-embedded/cross
+        # see https://github.com/rust-embedded/cross
+        if: contains(matrix.config.target, 'android')
+        run: |
+          cargo install cross
+          echo 'alias cargo=cross' >> $HOME/.bash_profile
+
+      - name: Build android docker images
+        if: contains(matrix.config.target, 'android')
+        run: |
+          sudo apt update
+          sudo apt install docker
+          docker build --target ${{ matrix.config.target }} -t denoland/rusty_v8:${{ matrix.config.target }} .
 
       - name: Configure cargo data directory
         # After this point, all cargo registry and crate data is stored in
@@ -149,15 +190,15 @@ jobs:
           echo "::add-path::$(pwd)/$basename"
 
       - name: Test
-        run: cargo test -vv --all-targets --locked ${{ env.CARGO_VARIANT_FLAG }}
+        run: ${{ matrix.config.cargo }} test -vv --all-targets --locked ${{ env.CARGO_VARIANT_FLAG }}
           --target ${{ matrix.config.target }}
 
       - name: Clippy
-        run: cargo clippy --all-targets --locked ${{ env.CARGO_VARIANT_FLAG }}
+        run: ${{ matrix.config.cargo }} clippy --all-targets --locked ${{ env.CARGO_VARIANT_FLAG }}
           --target ${{ matrix.config.target }} -- -D clippy::all
 
       - name: Rustfmt
-        run: cargo fmt -- --check
+        run: ${{ matrix.config.cargo }} fmt -- --check
 
       - name: Prepare binary publish
         run: cp
