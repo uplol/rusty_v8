@@ -99,11 +99,13 @@ use crate::Data;
 use crate::DataError;
 use crate::Handle;
 use crate::Isolate;
+use crate::IsolateHandle;
 use crate::Local;
 use crate::Message;
 use crate::Object;
 use crate::Primitive;
 use crate::PromiseRejectMessage;
+use crate::SnapshotCreator;
 use crate::Value;
 
 /// Stack-allocated class which sets the execution context for all operations
@@ -145,9 +147,9 @@ impl<'s, P: param::NewContextScope<'s>> ContextScope<'s, P> {
 /// handle and may deallocate it.  The behavior of accessing a handle
 /// for which the handle scope has been deleted is undefined.
 #[derive(Debug)]
-pub struct HandleScope<'s, C = Context> {
+pub struct HandleScope<'s, C = Context, I = IsolateHandle> {
   data: NonNull<data::ScopeData>,
-  _phantom: PhantomData<&'s mut C>,
+  _phantom: PhantomData<(&'s mut C, &'s mut I)>,
 }
 
 impl<'s> HandleScope<'s> {
@@ -228,6 +230,8 @@ impl<'s> HandleScope<'s, ()> {
     data::ScopeData::get(self).get_isolate_ptr()
   }
 }
+
+impl<'s> HandleScope<'s, (), SnapshotCreator> {}
 
 impl<'s> HandleScope<'s> {
   /// Return data that was previously attached to the isolate snapshot via
@@ -678,6 +682,8 @@ impl<T: Scope> ScopeCast for T {
 /// actual, merged scope type will be that `new()` returns for a specific
 /// parameter type.
 mod param {
+  use crate::isolate::{IsolateProvider, IsolateScope};
+
   use super::*;
 
   pub trait NewContextScope<'s>: getter::GetScopeData {
@@ -716,11 +722,11 @@ mod param {
     type NewScope = HandleScope<'s, ()>;
   }
 
-  impl<'s, P> NewHandleScope<'s> for Locker<P> {
+  impl<'s, P: IsolateProvider> NewHandleScope<'s> for IsolateScope<P> {
     type NewScope = HandleScope<'s, ()>;
   }
 
-  impl<'s, P> NewHandleScope<'s> for &'s mut Locker<P> {
+  impl<'s, P: IsolateProvider> NewHandleScope<'s> for &'s mut IsolateScope<P> {
     type NewScope = HandleScope<'s, ()>;
   }
 
@@ -758,15 +764,17 @@ mod param {
     }
   }
 
-  impl<'s, P> NewHandleScopeWithContext<'s> for Locker<P> {
+  impl<'s, P: IsolateProvider> NewHandleScopeWithContext<'s> for IsolateScope<P> {
     fn get_isolate_mut(&mut self) -> &mut Isolate {
-      &mut *self.get_isolate()
+      unsafe { self.get_isolate_ptr().as_mut().unwrap() }
     }
   }
 
-  impl<'s, P> NewHandleScopeWithContext<'s> for &'s mut Locker<P> {
+  impl<'s, P: IsolateProvider> NewHandleScopeWithContext<'s>
+    for &'s mut IsolateScope<P>
+  {
     fn get_isolate_mut(&mut self) -> &mut Isolate {
-      &mut *self.get_isolate()
+      unsafe { self.get_isolate_ptr().as_mut().unwrap() }
     }
   }
 
@@ -840,11 +848,11 @@ mod param {
     type NewScope = CallbackScope<'s, ()>;
   }
 
-  impl<'s, P> NewCallbackScope<'s> for &'s mut Locker<P> {
+  impl<'s, P: IsolateProvider> NewCallbackScope<'s> for &'s mut IsolateScope<P> {
     type NewScope = CallbackScope<'s, ()>;
   }
 
-  impl<'s, P> NewCallbackScope<'s> for Locker<P> {
+  impl<'s, P: IsolateProvider> NewCallbackScope<'s> for IsolateScope<P> {
     type NewScope = CallbackScope<'s, ()>;
   }
 
@@ -883,6 +891,8 @@ mod param {
 /// and `ScopeData` for many different types. The implementation of those traits
 /// on the types that implement them are also all contained in this module.
 mod getter {
+  use crate::isolate::{IsolateProvider, IsolateScope};
+
   pub use super::*;
 
   pub trait GetIsolate<'s> {
@@ -895,13 +905,13 @@ mod getter {
     }
   }
 
-  impl<'s, P> GetIsolate<'s> for Locker<P> {
+  impl<'s, P: IsolateProvider> GetIsolate<'s> for IsolateScope<P> {
     unsafe fn get_isolate_mut(self) -> &'s mut Isolate {
       &mut *self.get_isolate_ptr()
     }
   }
 
-  impl<'s, P> GetIsolate<'s> for &'s mut Locker<P> {
+  impl<'s, P: IsolateProvider> GetIsolate<'s> for &'s mut IsolateScope<P> {
     unsafe fn get_isolate_mut(self) -> &'s mut Isolate {
       &mut *self.get_isolate_ptr()
     }
@@ -961,15 +971,19 @@ mod getter {
     }
   }
 
-  impl<P> GetScopeData for Locker<P> {
+  impl<P: IsolateProvider> GetScopeData for IsolateScope<P> {
     fn get_scope_data_mut(&mut self) -> &mut data::ScopeData {
-      data::ScopeData::get_root_mut(self.get_isolate())
+      data::ScopeData::get_root_mut(unsafe {
+        self.get_isolate_ptr().as_mut().unwrap()
+      })
     }
   }
 
-  impl<P> GetScopeData for &'_ mut Locker<P> {
+  impl<P: IsolateProvider> GetScopeData for &'_ mut IsolateScope<P> {
     fn get_scope_data_mut(&mut self) -> &mut data::ScopeData {
-      data::ScopeData::get_root_mut(self.get_isolate())
+      data::ScopeData::get_root_mut(unsafe {
+        self.get_isolate_ptr().as_mut().unwrap()
+      })
     }
   }
 }
@@ -1727,9 +1741,11 @@ mod raw {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::isolate::IsolateScope;
   use crate::new_default_platform;
   use crate::Global;
   use crate::IsolateHandle;
+  use crate::RemoteIsolateHandle;
   use crate::V8;
   use std::any::type_name;
   use std::sync::Once;
@@ -1763,11 +1779,11 @@ mod tests {
   fn deref_types() {
     initialize_v8();
     let isolate = &mut Isolate::new(Default::default());
-    AssertTypeOf(isolate).is::<Locker>();
+    AssertTypeOf(isolate).is::<IsolateScope>();
     let handle = &mut Isolate::new_handle(Default::default());
     AssertTypeOf(handle).is::<IsolateHandle>();
     let locker = &mut handle.lock();
-    AssertTypeOf(locker).is::<Locker<&'_ mut ()>>();
+    AssertTypeOf(locker).is::<Locker<&mut IsolateHandle>>();
     let l1_hs = &mut HandleScope::new(isolate);
     AssertTypeOf(l1_hs).is::<HandleScope<()>>();
     let context = Context::new(l1_hs);
@@ -1871,7 +1887,7 @@ mod tests {
   fn new_scope_types() {
     initialize_v8();
     let mut isolate = Isolate::new(Default::default());
-    AssertTypeOf(&isolate).is::<Locker>();
+    AssertTypeOf(&isolate).is::<IsolateScope>();
     let global_context: Global<Context>;
     {
       let l1_hs = &mut HandleScope::new(&mut isolate);

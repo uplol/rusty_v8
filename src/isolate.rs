@@ -1,3 +1,4 @@
+use crate::SnapshotCreator;
 // Copyright 2019-2021 the Deno authors. All rights reserved. MIT license.
 use crate::function::FunctionCallbackInfo;
 use crate::isolate_create_params::raw::CreateParams as RawCreateParams;
@@ -246,9 +247,9 @@ extern "C" {
   );
   fn v8__Isolate__HasPendingBackgroundTasks(isolate: *const Isolate) -> bool;
 
-  fn v8__Locker__CONSTRUCT(buf: *mut [u8; LOCKER_SIZE], isolate: *mut Isolate);
+  fn v8__Locker__CONSTRUCT(buf: *mut raw::Locker, isolate: *mut Isolate);
   fn v8__Locker__IsLocked(isolate: *mut Isolate) -> bool;
-  fn v8__Locker__DESTRUCT(this: *mut Locker);
+  fn v8__Locker__DESTRUCT(this: *mut raw::Locker);
   // fn v8__Unlocker__CONSTRUCT(buf: *mut Unlocker, isolate: *mut Isolate);
   // fn v8__Unlocker__DESTRUCT(this: &mut Unlocker);
 
@@ -316,7 +317,7 @@ impl Isolate {
   ///
   /// V8::initialize() must have run prior to this.
   #[allow(clippy::new_ret_no_self)]
-  pub fn new(params: CreateParams) -> Locker {
+  pub fn new(params: CreateParams) -> IsolateScope<IsolateHandle> {
     crate::V8::assert_initialized();
     let (raw_create_params, create_param_allocations) = params.finalize();
     let cxx_isolate = unsafe {
@@ -324,11 +325,11 @@ impl Isolate {
         .unwrap()
         .as_mut();
       ScopeData::new_root(cxx_isolate);
-      cxx_isolate.create_annex(create_param_allocations, true, true);
+      cxx_isolate.create_annex(create_param_allocations, true);
       cxx_isolate
     };
-    let mut handle = IsolateHandle::new(cxx_isolate);
-    handle.lock_as_owned()
+    let handle = IsolateHandle::new_from_isolate(cxx_isolate);
+    handle.into_scope()
   }
 
   pub fn new_handle(params: CreateParams) -> IsolateHandle {
@@ -339,10 +340,10 @@ impl Isolate {
         .unwrap()
         .as_mut();
       ScopeData::new_root(cxx_isolate);
-      cxx_isolate.create_annex(create_param_allocations, true, false);
+      cxx_isolate.create_annex(create_param_allocations, true);
       cxx_isolate
     };
-    IsolateHandle::new(cxx_isolate)
+    IsolateHandle::new_from_isolate(cxx_isolate)
   }
 
   /// Initial configuration parameters for a new Isolate.
@@ -350,36 +351,19 @@ impl Isolate {
     CreateParams::default()
   }
 
-  pub fn thread_safe_handle(&self) -> IsolateHandle {
-    IsolateHandle::new(self)
-  }
-
-  /// See [`ThreadSafeHandle::terminate_execution`]
-  pub fn terminate_execution(&self) {
-    self.thread_safe_handle().terminate_execution()
-  }
-
-  /// See [`ThreadSafeHandle::cancel_terminate_execution`]
-  pub fn cancel_terminate_execution(&self) {
-    self.thread_safe_handle().cancel_terminate_execution()
-  }
-
-  /// See [`ThreadSafeHandle::is_execution_terminating`]
-  pub fn is_execution_terminating(&self) -> bool {
-    self.thread_safe_handle().is_execution_terminating()
+  pub fn remote_handle(&self) -> RemoteIsolateHandle {
+    RemoteIsolateHandle::new_from_isolate(self)
   }
 
   pub(crate) fn create_annex(
     &mut self,
     create_param_allocations: Box<dyn Any>,
     dispose_on_drop: bool,
-    dispose_on_unlock: bool,
   ) {
     let annex_arc = Arc::new(IsolateAnnex::new(
       self,
       create_param_allocations,
       dispose_on_drop,
-      dispose_on_unlock,
     ));
     let annex_ptr = Arc::into_raw(annex_arc);
     unsafe {
@@ -742,13 +726,20 @@ impl Isolate {
   }
 }
 
-pub(crate) struct IsolateAnnex {
+impl Deref for Isolate {
+  type Target = IsolateAnnex;
+
+  fn deref(&self) -> &Self::Target {
+    self.get_annex()
+  }
+}
+
+pub struct IsolateAnnex {
   create_param_allocations: Box<dyn Any>,
   slots: HashMap<TypeId, Box<dyn Any>, BuildTypeIdHasher>,
   disposal_queue: Mutex<Vec<NonNull<dyn Any>>>,
   isolate: *mut Isolate,
   dispose_on_drop: bool,
-  dispose_on_unlock: bool,
 }
 
 impl IsolateAnnex {
@@ -756,7 +747,6 @@ impl IsolateAnnex {
     isolate: &mut Isolate,
     create_param_allocations: Box<dyn Any>,
     dispose_on_drop: bool,
-    dispose_on_unlock: bool,
   ) -> Self {
     Self {
       create_param_allocations,
@@ -764,7 +754,6 @@ impl IsolateAnnex {
       disposal_queue: Default::default(),
       isolate,
       dispose_on_drop,
-      dispose_on_unlock,
     }
   }
 
@@ -790,74 +779,6 @@ impl IsolateAnnex {
 
   pub(crate) unsafe fn get_isolate_ptr(&self) -> *mut Isolate {
     self.isolate
-  }
-}
-
-impl Debug for IsolateAnnex {
-  fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-    f.debug_struct("IsolateAnnex")
-      .field("isolate", &self.isolate)
-      .finish()
-  }
-}
-
-impl Drop for IsolateAnnex {
-  /// Disposes the isolate.  The isolate must not be entered by any
-  /// thread to be disposable.
-  fn drop(&mut self) {
-    let isolate = unsafe { self.isolate.as_mut().unwrap() };
-
-    // Drop the scope stack.
-    ScopeData::drop_root(isolate);
-
-    // Clear slots and drop owned objects that were taken out of `CreateParams`.
-    let annex = isolate.get_annex_mut();
-    annex.create_param_allocations = Box::new(());
-    annex.slots.clear();
-    unsafe { isolate.set_data(0, null_mut()) };
-
-    // Some Isolate instances (ie. SnapshotCreator) must not be disposed.
-    if self.dispose_on_drop {
-      // No test case in rusty_v8 show this, but there have been situations in
-      // deno where dropping Annex before the states causes a segfault.
-      unsafe { v8__Isolate__Dispose(isolate) };
-    }
-  }
-}
-
-/// A thread-safe reference-counted handle for an [`Isolate`]. Can be cloned and
-/// sent between threads. To enter an Isolate, use [IsolateHandle::lock]. When
-/// all IsolateHandle references are dropped, the Isolate is finally disposed.
-#[derive(Clone, Debug)]
-pub struct IsolateHandle(Arc<IsolateAnnex>);
-
-/// IsolateHandle instances are thread-safe.
-unsafe impl Send for IsolateHandle {}
-unsafe impl Sync for IsolateHandle {}
-
-impl IsolateHandle {
-  /// Creates a new IsolateHandle from an existing Isolate reference.
-  /// It is assumed an annex has been created for the Isolate.
-  pub(crate) fn new(isolate: &Isolate) -> Self {
-    Self(isolate.get_annex_arc())
-  }
-
-  // This function is marked unsafe because it must be called only with either
-  // IsolateAnnex::mutex locked, or from the main thread associated with the V8
-  // isolate.
-  pub(crate) unsafe fn get_isolate_ptr(&self) -> *mut Isolate {
-    self.0.isolate
-  }
-
-  /// Creates an owned locker from the isolate, used in Isolate::new()
-  pub(crate) fn lock_as_owned(&mut self) -> Locker {
-    unsafe { Locker::new(self.get_isolate_ptr().as_mut().unwrap()) }
-  }
-
-  /// Borrows a new [`Locker`] reference for the Isolate. While Locked, the
-  /// embedder is free to interact with an Isolate on the current thread.
-  pub fn lock(&mut self) -> Locker<&mut ()> {
-    unsafe { Locker::new(self.get_isolate_ptr().as_mut().unwrap()) }
   }
 
   /// Check if this isolate is in use. True if at least one thread Enter'ed
@@ -932,9 +853,362 @@ impl IsolateHandle {
   /// the thread -- all thread-specific data for an Isolate is discarded when
   /// an Isolate is disposed so this call is pointless if an Isolate is about
   /// to be Disposed.
-  pub fn discard_thread_specific_metadata(&mut self) {
+  pub fn discard_thread_specific_metadata(&self) {
     unsafe {
       v8__Isolate__DiscardThreadSpecificMetadata(self.get_isolate_ptr())
+    }
+  }
+}
+
+impl Debug for IsolateAnnex {
+  fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+    f.debug_struct("IsolateAnnex")
+      .field("isolate", &self.isolate)
+      .finish()
+  }
+}
+
+impl Drop for IsolateAnnex {
+  /// Disposes the isolate.  The isolate must not be entered by any
+  /// thread to be disposable.
+  fn drop(&mut self) {
+    let isolate = unsafe { self.isolate.as_mut().unwrap() };
+
+    // Drop the scope stack.
+    ScopeData::drop_root(isolate);
+
+    // Clear slots and drop owned objects that were taken out of `CreateParams`.
+    let annex = isolate.get_annex_mut();
+    annex.create_param_allocations = Box::new(());
+    annex.slots.clear();
+    unsafe { isolate.set_data(0, null_mut()) };
+
+    // Some Isolate instances (ie. SnapshotCreator) must not be disposed.
+    if self.dispose_on_drop {
+      // No test case in rusty_v8 show this, but there have been situations in
+      // deno where dropping Annex before the states causes a segfault.
+      unsafe { v8__Isolate__Dispose(isolate) };
+    }
+  }
+}
+
+/// A thread-safe reference-counted handle for an [`Isolate`]. Can be cloned and
+/// sent between threads. To enter an Isolate, use [IsolateHandle::lock]. When
+/// all IsolateHandle references are dropped, the Isolate is finally disposed.
+#[derive(Clone, Debug)]
+pub struct IsolateHandle(Arc<IsolateAnnex>);
+
+/// IsolateHandles are thread-safe.
+unsafe impl Send for IsolateHandle {}
+unsafe impl Sync for IsolateHandle {}
+
+impl IsolateHandle {
+  /// Creates a new IsolateHandle from an existing Isolate reference.
+  /// It is assumed an annex has been created for the Isolate.
+  pub(crate) fn new_from_isolate(isolate: &Isolate) -> Self {
+    Self(isolate.get_annex_arc())
+  }
+
+  // This function is marked unsafe because it must be called only with either
+  // IsolateAnnex::mutex locked, or from the main thread associated with the V8
+  // isolate.
+  pub(crate) unsafe fn get_isolate_ptr(&self) -> *mut Isolate {
+    self.0.isolate
+  }
+
+  /// Creates an owned locker from the isolate, used in Isolate::new()
+  pub(crate) fn into_scope(self) -> IsolateScope<Self> {
+    IsolateScope::new(Locker::new(self))
+  }
+
+  /// Borrows a new [`Locker`] reference for the Isolate, and locks it for the
+  /// current thread.
+  ///
+  /// This function will block if any other thread has a lock on the
+  /// Isolate.
+  ///
+  /// Note: You may want to use `enter()` instead if you wish to immediately
+  /// create new [`HandleScope`]s for this Isolate in the current thread.
+  pub fn lock(&mut self) -> Locker<&mut Self> {
+    Locker::new(self)
+  }
+
+  /// Borrows a new [`Locker`] reference for the Isolate. While Locked, the
+  /// embedder is free to interact with an Isolate on the current thread.
+  pub fn enter(&mut self) -> IsolateScope<&mut Self> {
+    IsolateScope::new(Locker::new(self))
+  }
+}
+
+impl Deref for IsolateHandle {
+  type Target = IsolateAnnex;
+
+  fn deref(&self) -> &Self::Target {
+    &self.0
+  }
+}
+
+/// A RemoteIsolateHandle is similar to an [`IsolateHandle`], but is a weak
+/// reference and does not count towards the reference count. It may be useful
+/// in scenarios where the handle is used to to terminate execution from another
+/// thread.
+///
+/// All methods on this type are checked, returning `false` if the Isolate has
+/// already been disposed.
+pub struct RemoteIsolateHandle(Weak<IsolateAnnex>);
+
+impl RemoteIsolateHandle {
+  /// Creates a new IsolateHandleThreadSafe from an existing Isolate reference.
+  /// It is assumed an annex has been created for the Isolate.
+  pub(crate) fn new_from_isolate(isolate: &Isolate) -> Self {
+    Self(isolate.get_annex_weak())
+  }
+
+  /// Returns `true` if the Isolate has been disposed.
+  pub fn is_disposed(&self) -> bool {
+    self.0.upgrade().is_none()
+  }
+
+  /// See [`IsolateHandle::is_in_use()`].
+  ///
+  /// Returns `false` if the Isolate reference could not be upgraded and the
+  /// Isolate has been disposed.
+  pub fn is_in_use(&self) -> bool {
+    if let Some(handle) = self.0.upgrade() {
+      handle.is_in_use()
+    } else {
+      false
+    }
+  }
+
+  /// Returns whether or not the isolate is alive and locked by the current
+  /// thread. See [`Locker::is_locked()`].
+  ///
+  /// Returns `false` if the Isolate reference could not be upgraded and the
+  /// Isolate has been disposed.
+  pub fn is_locked(&self) -> bool {
+    if let Some(handle) = self.0.upgrade() {
+      unsafe { Locker::is_locked(handle.get_isolate_ptr()) }
+    } else {
+      false
+    }
+  }
+
+  /// Forcefully terminate the current thread of JavaScript execution
+  /// in the given isolate.
+  ///
+  /// This method can be used by any thread even if that thread has not
+  /// acquired the V8 lock with a Locker object.
+  ///
+  /// Returns `false` if the Isolate reference could not be upgraded and the
+  /// Isolate has been disposed.
+  pub fn terminate_execution(&self) -> bool {
+    if let Some(handle) = self.0.upgrade() {
+      unsafe { v8__Isolate__TerminateExecution(handle.get_isolate_ptr()) };
+      true
+    } else {
+      false
+    }
+  }
+
+  /// Resume execution capability in the given isolate, whose execution
+  /// was previously forcefully terminated using TerminateExecution().
+  ///
+  /// When execution is forcefully terminated using TerminateExecution(),
+  /// the isolate can not resume execution until all JavaScript frames
+  /// have propagated the uncatchable exception which is generated.  This
+  /// method allows the program embedding the engine to handle the
+  /// termination event and resume execution capability, even if
+  /// JavaScript frames remain on the stack.
+  ///
+  /// Returns `false` if the Isolate reference could not be upgraded and the
+  /// Isolate has been disposed.
+  pub fn cancel_terminate_execution(&self) -> bool {
+    if let Some(handle) = self.0.upgrade() {
+      unsafe {
+        v8__Isolate__CancelTerminateExecution(handle.get_isolate_ptr())
+      };
+      true
+    } else {
+      false
+    }
+  }
+
+  /// Is V8 terminating JavaScript execution.
+  ///
+  /// Returns true if JavaScript execution is currently terminating
+  /// because of a call to TerminateExecution.  In that case there are
+  /// still JavaScript frames on the stack and the termination
+  /// exception is still active.
+  ///
+  /// Returns `false` if the Isolate reference could not be upgraded and the
+  /// Isolate has been disposed.
+  pub fn is_execution_terminating(&self) -> bool {
+    if let Some(handle) = self.0.upgrade() {
+      unsafe { v8__Isolate__IsExecutionTerminating(handle.get_isolate_ptr()) }
+    } else {
+      false
+    }
+  }
+
+  /// Request V8 to interrupt long running JavaScript code and invoke
+  /// the given |callback| passing the given |data| to it. After |callback|
+  /// returns control will be returned to the JavaScript code.
+  /// There may be a number of interrupt requests in flight.
+  /// Can be called from another thread without acquiring a |Locker|.
+  /// Registered |callback| must not reenter interrupted Isolate.
+  ///
+  /// Returns `false` if the Isolate reference could not be upgraded and the
+  /// Isolate has been disposed.
+  // Clippy warns that this method is dereferencing a raw pointer, but it is
+  // not: https://github.com/rust-lang/rust-clippy/issues/3045
+  #[allow(clippy::not_unsafe_ptr_arg_deref)]
+  pub fn request_interrupt(
+    &self,
+    callback: InterruptCallback,
+    data: *mut c_void,
+  ) -> bool {
+    if let Some(handle) = self.0.upgrade() {
+      unsafe {
+        v8__Isolate__RequestInterrupt(handle.get_isolate_ptr(), callback, data)
+      };
+      true
+    } else {
+      false
+    }
+  }
+
+  /// Discards all V8 thread-specific data for the Isolate. Should be used
+  /// if a thread is terminating and it has used an Isolate that will outlive
+  /// the thread -- all thread-specific data for an Isolate is discarded when
+  /// an Isolate is disposed so this call is pointless if an Isolate is about
+  /// to be Disposed.
+  pub fn discard_thread_specific_metadata(&mut self) -> bool {
+    if let Some(handle) = self.0.upgrade() {
+      unsafe {
+        v8__Isolate__DiscardThreadSpecificMetadata(handle.get_isolate_ptr())
+      }
+      true
+    } else {
+      false
+    }
+  }
+}
+
+pub trait IsolateProvider {
+  type Target;
+  unsafe fn get_isolate_ptr(&self) -> *mut Isolate;
+  unsafe fn as_target_ref(&self) -> &Self::Target;
+  unsafe fn as_target(&mut self) -> &mut Self::Target;
+}
+
+impl IsolateProvider for IsolateHandle {
+  type Target = Isolate;
+  unsafe fn get_isolate_ptr(&self) -> *mut Isolate {
+    self.0.isolate
+  }
+
+  unsafe fn as_target_ref(&self) -> &Self::Target {
+    self.0.isolate.as_ref().unwrap()
+  }
+
+  unsafe fn as_target(&mut self) -> &mut Self::Target {
+    self.0.isolate.as_mut().unwrap()
+  }
+}
+
+impl IsolateProvider for &mut IsolateHandle {
+  type Target = Isolate;
+  unsafe fn get_isolate_ptr(&self) -> *mut Isolate {
+    self.0.isolate
+  }
+
+  unsafe fn as_target_ref(&self) -> &Self::Target {
+    self.0.isolate.as_ref().unwrap()
+  }
+
+  unsafe fn as_target(&mut self) -> &mut Self::Target {
+    self.0.isolate.as_mut().unwrap()
+  }
+}
+
+impl IsolateProvider for SnapshotCreator {
+  type Target = SnapshotCreator;
+  unsafe fn get_isolate_ptr(&self) -> *mut Isolate {
+    self.get_raw_isolate()
+  }
+
+  unsafe fn as_target_ref(&self) -> &Self::Target {
+    self
+  }
+
+  unsafe fn as_target(&mut self) -> &mut Self::Target {
+    self
+  }
+}
+
+impl IsolateProvider for &mut SnapshotCreator {
+  type Target = SnapshotCreator;
+  unsafe fn get_isolate_ptr(&self) -> *mut Isolate {
+    self.get_raw_isolate()
+  }
+
+  unsafe fn as_target_ref(&self) -> &Self::Target {
+    self
+  }
+
+  unsafe fn as_target(&mut self) -> &mut Self::Target {
+    self
+  }
+}
+
+/// An IsolateScope represents an enter'd [`Isolate`], and may be used to create
+/// new [`HandleScope`]s, which are required for executing code in a v8 context.
+/// The IsolateScope wraps a [`Locker`] which ensures the inner Isolate may only
+/// be used by the current thread. When the IsolateScope is dropped, the isolate
+/// is exited.
+pub struct IsolateScope<P = IsolateHandle, L = Locker<P>>(L, PhantomData<P>)
+where
+  P: IsolateProvider,
+  L: IsolateProvider;
+
+impl<P: IsolateProvider, L: IsolateProvider> IsolateScope<P, L> {
+  pub fn new(locker: L) -> IsolateScope<P, L> {
+    unsafe {
+      locker.get_isolate_ptr().as_mut().unwrap().enter();
+    }
+    Self(locker, PhantomData::default())
+  }
+}
+
+impl<P: IsolateProvider + Send + 'static> IsolateScope<P> {
+  /// Creates a new thread-safe handle for this Isolate, which may be useful
+  /// for terminating active v8 execution from another thread.
+  pub fn thread_safe_handle(&self) -> IsolateHandle {
+    IsolateHandle::new_from_isolate(unsafe {
+      self.get_isolate_ptr().as_ref().unwrap()
+    })
+  }
+}
+
+impl<P: IsolateProvider> Deref for IsolateScope<P> {
+  type Target = Locker<P>;
+
+  fn deref(&self) -> &Self::Target {
+    &self.0
+  }
+}
+
+impl<P: IsolateProvider> DerefMut for IsolateScope<P> {
+  fn deref_mut(&mut self) -> &mut Self::Target {
+    &mut self.0
+  }
+}
+
+impl<P: IsolateProvider, L: IsolateProvider> Drop for IsolateScope<P, L> {
+  fn drop(&mut self) {
+    unsafe {
+      self.0.get_isolate_ptr().as_mut().unwrap().exit();
     }
   }
 }
@@ -948,41 +1222,32 @@ impl IsolateHandle {
 /// rusty_v8 note: The Locker lifecycle is managed while a LockedIsolate is
 /// borrowed from a SharedIsolate.
 #[derive(Debug)]
-#[repr(C)]
-pub struct Locker<P = ()> {
-  has_lock: bool,
-  top_level: bool,
-  isolate: *mut Isolate,
-  _owner: PhantomData<P>,
+pub struct Locker<P = IsolateHandle>
+where
+  P: IsolateProvider,
+{
+  inner: raw::Locker,
+  isolate_provider: P,
 }
 
-impl<P> Locker<P> {
+impl<P: IsolateProvider> Locker<P> {
   /// Creates a locker using the provided Isolate pointer.
-  pub(crate) unsafe fn new(isolate: &mut Isolate) -> Locker<P> {
-    let mut locker = Locker {
-      has_lock: false,
-      top_level: true,
-      isolate,
-      _owner: PhantomData::<P>::default(),
+  pub(crate) fn new(isolate_provider: P) -> Locker<P> {
+    let isolate =
+      unsafe { isolate_provider.get_isolate_ptr().as_mut().unwrap() };
+    let locker = Locker {
+      inner: raw::Locker::new(isolate),
+      isolate_provider,
     };
-    v8__Locker__CONSTRUCT((&mut locker as *mut Locker<P>).cast(), isolate);
 
-    // clear the disposal queue
+    // reset/drop any marked Global handles for disposal
     isolate.get_annex_mut().dispose_marked_handles();
-
-    // enter the isolate
-    isolate.enter();
 
     locker
   }
 
-  pub(crate) unsafe fn get_isolate_ptr(&self) -> *mut Isolate {
-    self.isolate
-  }
-
-  /// Returns a reference to the backing [`Isolate`] for this Locker.
-  pub fn get_isolate(&mut self) -> &mut Isolate {
-    unsafe { self.isolate.as_mut().unwrap() }
+  pub fn enter(&mut self) -> IsolateScope<P, &mut Self> {
+    IsolateScope::new(self)
   }
 }
 
@@ -994,38 +1259,96 @@ impl Locker {
   }
 }
 
-impl<P> Drop for Locker<P> {
+impl<P: IsolateProvider> Deref for Locker<P> {
+  type Target = P::Target;
+
+  fn deref(&self) -> &Self::Target {
+    unsafe { self.isolate_provider.as_target_ref() }
+  }
+}
+
+impl<P: IsolateProvider> DerefMut for Locker<P> {
+  fn deref_mut(&mut self) -> &mut Self::Target {
+    unsafe { self.isolate_provider.as_target() }
+  }
+}
+
+impl<P: IsolateProvider> IsolateProvider for Locker<P> {
+  type Target = P;
+
+  unsafe fn get_isolate_ptr(&self) -> *mut Isolate {
+    self.isolate_provider.get_isolate_ptr()
+  }
+
+  unsafe fn as_target_ref(&self) -> &Self::Target {
+    &self.isolate_provider
+  }
+
+  unsafe fn as_target(&mut self) -> &mut Self::Target {
+    &mut self.isolate_provider
+  }
+}
+
+impl<P: IsolateProvider> IsolateProvider for &mut Locker<P> {
+  type Target = P;
+
+  unsafe fn get_isolate_ptr(&self) -> *mut Isolate {
+    self.isolate_provider.get_isolate_ptr()
+  }
+
+  unsafe fn as_target_ref(&self) -> &Self::Target {
+    &self.isolate_provider
+  }
+
+  unsafe fn as_target(&mut self) -> &mut Self::Target {
+    &mut self.isolate_provider
+  }
+}
+
+impl<P: IsolateProvider> Drop for Locker<P> {
   fn drop(&mut self) {
     unsafe {
-      let isolate = self.isolate.as_mut().unwrap();
+      let isolate = self.isolate_provider.get_isolate_ptr().as_mut().unwrap();
       ScopeData::get_root_mut(isolate);
 
       // clear the disposal queue
       isolate.get_annex_mut().dispose_marked_handles();
-
-      isolate.exit();
-      {
-        v8__Locker__DESTRUCT((self as *mut Locker<_>).cast());
-        let should_dispose = isolate.get_annex().dispose_on_unlock;
-        if should_dispose {
-          isolate.drop_annex();
-        }
-      }
     }
   }
 }
 
-impl<P> Deref for Locker<P> {
-  type Target = Isolate;
-
-  fn deref(&self) -> &Self::Target {
-    unsafe { self.isolate.as_ref().unwrap() }
+mod raw {
+  use super::*;
+  /// This is a native handle to a v8 Locker. See [`crate::Locker`] for more
+  /// information on the usage of Lockers in rusty_v8.
+  #[derive(Debug)]
+  #[repr(C)]
+  pub struct Locker {
+    has_lock: bool,
+    top_level: bool,
+    isolate: *mut Isolate,
   }
-}
 
-impl<P> DerefMut for Locker<P> {
-  fn deref_mut(&mut self) -> &mut Self::Target {
-    unsafe { self.isolate.as_mut().unwrap() }
+  impl Locker {
+    pub(crate) fn new(isolate: *mut Isolate) -> Locker {
+      let mut locker = Locker {
+        has_lock: false,
+        top_level: false,
+        isolate,
+      };
+      unsafe {
+        v8__Locker__CONSTRUCT(&mut locker as *mut Locker, isolate);
+      }
+      locker
+    }
+  }
+
+  impl Drop for Locker {
+    fn drop(&mut self) {
+      unsafe {
+        v8__Locker__DESTRUCT(self);
+      }
+    }
   }
 }
 

@@ -4,6 +4,7 @@ use std::hash::Hasher;
 use std::marker::PhantomData;
 use std::mem::transmute;
 use std::ops::Deref;
+use std::ops::DerefMut;
 use std::ptr::NonNull;
 use std::sync::Arc;
 use std::sync::Weak;
@@ -380,7 +381,7 @@ impl From<&'_ IsolateHandle> for HandleHost {
 
 impl From<&'_ mut Locker> for HandleHost {
   fn from(locker: &'_ mut Locker) -> Self {
-    Self::Isolate(NonNull::from(locker.get_isolate()))
+    Self::Isolate(NonNull::from(locker.deref_mut()))
   }
 }
 

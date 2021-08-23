@@ -11,7 +11,7 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::sync::Once;
 
-struct CoreIsolate(v8::Locker);
+struct CoreIsolate(v8::IsolateScope);
 
 struct CoreIsolateState {
   drop_count: Rc<AtomicUsize>,
@@ -130,7 +130,7 @@ fn slots_layer1() {
   let mut core_isolate = CoreIsolate::new(drop_count.clone());
   // The existence of a IsolateHandle that outlives the isolate should not
   // inhibit dropping of slot contents.
-  let isolate_handle = core_isolate.thread_safe_handle();
+  let isolate_handle = core_isolate.remote_handle();
   assert!(core_isolate.execute("1 + 1"));
   assert!(!core_isolate.execute("throw 'foo'"));
   assert_eq!(0, core_isolate.get_i());

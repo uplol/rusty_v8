@@ -1,4 +1,6 @@
 use crate::external_references::ExternalReferences;
+use crate::isolate::IsolateProvider;
+use crate::isolate::IsolateScope;
 use crate::isolate::Locker;
 use crate::scope::data::ScopeData;
 use crate::support::char;
@@ -13,6 +15,7 @@ use std::borrow::Borrow;
 use std::convert::TryFrom;
 use std::mem::MaybeUninit;
 use std::ops::Deref;
+use std::ops::DerefMut;
 
 extern "C" {
   fn v8__SnapshotCreator__CONSTRUCT(
@@ -115,15 +118,13 @@ impl SnapshotCreator {
           .unwrap()
       };
       ScopeData::new_root(isolate);
-      isolate.create_annex(Box::new(()), true, false);
+      isolate.create_annex(Box::new(()), false);
     }
     snapshot_creator
   }
-}
 
-impl Drop for SnapshotCreator {
-  fn drop(&mut self) {
-    unsafe { v8__SnapshotCreator__DESTRUCT(self) };
+  pub(crate) unsafe fn get_raw_isolate(&self) -> *mut Isolate {
+    v8__SnapshotCreator__GetIsolate(self)
   }
 }
 
@@ -163,21 +164,9 @@ impl SnapshotCreator {
     }
   }
 
-  pub unsafe fn get_isolate_ptr(&self) -> *mut Isolate {
-    v8__SnapshotCreator__GetIsolate(self)
-  }
-
-  /// Borrows the Isolate from the SnapshotCreator.
-  pub fn get_isolate(&mut self) -> Locker<&'_ mut ()> {
-    unsafe { Locker::new(self.get_isolate_ptr().as_mut().unwrap()) }
-  }
-
-  /// Borrows the Isolate from the SnapshotCreator, also returning a reference
-  /// to the SnapshotCreator.
-  pub fn get_isolate_and_handle(
-    &mut self,
-  ) -> (Locker<&'_ mut ()>, &mut SnapshotCreator) {
-    unsafe { (Locker::new(self.get_isolate_ptr().as_mut().unwrap()), self) }
+  /// Borrows the Isolate from the SnapshotCreator, locked and entered.
+  pub fn get_isolate(&mut self) -> IsolateScope<&mut Self> {
+    IsolateScope::new(Locker::new(self))
   }
 
   /// Creates a snapshot data blob.
@@ -208,5 +197,19 @@ impl SnapshotCreator {
       debug_assert!(blob.raw_size > 0);
       Some(blob)
     }
+  }
+}
+
+impl Deref for SnapshotCreator {
+  type Target = Isolate;
+
+  fn deref(&self) -> &Self::Target {
+    unsafe { self.get_isolate_ptr().as_ref().unwrap() }
+  }
+}
+
+impl DerefMut for SnapshotCreator {
+  fn deref_mut(&mut self) -> &mut Self::Target {
+    unsafe { self.get_isolate_ptr().as_mut().unwrap() }
   }
 }
